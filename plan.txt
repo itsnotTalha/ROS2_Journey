@@ -1,0 +1,14 @@
+So lets break it down.
+I will use the Joy node.
+ros2 run joy joy_node
+Joy scans the data from /dev/input/js0
+So I need to run multiple Joy node using 
+ros2 run joy joy_node --ros-args -p dev:=/dev/input/js0 -r joy:=/joy/drive
+ros2 run joy joy_node --ros-args -p dev:=/dev/input/js1 -r joy:=/joy/arm
+
+So i need to do the following stuff->
+First i will select the controller. and get the dev location like /dev/input/js*
+When i will toggle the DRIVE ROS node it will start collecting data from joy/drive
+Similarly for arm i will collect the data from joy/arm.
+
+Then map it according to our need and push that value to another topic name aram for arm and buswala for driver,
