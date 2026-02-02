@@ -13,6 +13,26 @@ import curses
 from curses import wrapper
 import os
 import glob
+import json
+
+
+ASSIGNMENTS_FILE = "/tmp/ros_controller_assignments.json"
+
+
+def load_assignments():
+    try:
+        with open(ASSIGNMENTS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_assignments(assignments):
+    try:
+        with open(ASSIGNMENTS_FILE, "w") as f:
+            json.dump(assignments, f)
+    except Exception:
+        pass
 
 
 # ================================================================================
@@ -133,8 +153,8 @@ ARM_MAPPINGS = {
 # -------------------- CONTROLLER OWNER NAMES --------------------
 # Map MAC addresses to custom owner names for fun!
 CONTROLLER_OWNERS = {
-    "50:ee:32:04:32:53": "Abid Hossain",
-    "84:30:95:41:0e:74": "Fahim Hafiz",
+    "50:ee:32:04:32:53": "Chagol Chor",
+    "84:30:95:41:0e:74": "Goru Chor",
 }
 
 
@@ -226,6 +246,19 @@ class ControllerMenu:
         """
         self.controllers = find_joysticks()
 
+        # Restore from global assignments if possible
+        assignments = load_assignments()
+        if not self.drive and assignments.get("drive"):
+            for ctrl in self.controllers:
+                if ctrl["mac"] == assignments["drive"]:
+                    self.drive = ctrl
+                    break
+        if not self.arm and assignments.get("arm"):
+            for ctrl in self.controllers:
+                if ctrl["mac"] == assignments["arm"]:
+                    self.arm = ctrl
+                    break
+
         # Check if selected controllers are still connected
         if self.drive and self.drive not in self.controllers:
             # Find by MAC if controller reconnected on different path
@@ -310,20 +343,34 @@ class ControllerMenu:
         stdscr.refresh()
 
     # ---------------- POPUP ----------------
-    def popup_select(self, stdscr, title, assign, exclude_controller=None):
+    def popup_select(self, stdscr, title, assign, role, exclude_controller=None):
         """Popup for manual controller selection with MAC addresses.
         exclude_controller: controller dict that should be shown as unavailable (already in use)
+        role: "drive" or "arm" for global assignment tracking
         """
         sel = 0
         while True:
             # Refresh controller list
             self.controllers = find_joysticks()
-            
-            # Find available controllers (not already used by the other system)
+
+            # Load global assignments
+            assignments = load_assignments()
+            current_ctrl = getattr(self, role, None)
+            current_mac = current_ctrl.get("mac") if current_ctrl else None
+            global_in_use_macs = set()
+            for mac in assignments.values():
+                if mac and mac != current_mac:
+                    global_in_use_macs.add(mac)
+
+            # Find available controllers (not already used by the other system
+            # and not globally in use)
             available_indices = []
             for i, d in enumerate(self.controllers):
-                if exclude_controller and d.get("mac") == exclude_controller.get("mac"):
-                    continue  # This controller is in use
+                mac = d.get("mac")
+                if exclude_controller and mac == exclude_controller.get("mac"):
+                    continue  # This controller is in use by the other local role
+                if mac in global_in_use_macs:
+                    continue  # This controller is globally in use
                 available_indices.append(i)
             
             stdscr.clear()
@@ -335,8 +382,12 @@ class ControllerMenu:
                 stdscr.addstr(5, 6, "Connect a controller and press R to refresh.", curses.color_pair(4))
             else:
                 for i, d in enumerate(self.controllers):
+                    mac = d.get("mac")
                     # Check if this controller is already in use
-                    is_unavailable = exclude_controller and d.get("mac") == exclude_controller.get("mac")
+                    is_unavailable = (
+                        (exclude_controller and mac == exclude_controller.get("mac"))
+                        or (mac in global_in_use_macs)
+                    )
                     
                     # Show owner name if available, otherwise show controller name
                     owner = d.get("owner")
@@ -348,8 +399,9 @@ class ControllerMenu:
                     # Add unavailable indicator
                     if is_unavailable:
                         line1 = f"[X] {line1} [IN USE]"
-                    
-                    line2 = f"  Path: {d['path']}  MAC: {d.get('mac', 'N/A')[:30]}"
+
+                    mac_display = mac[:30] if mac else "N/A"
+                    line2 = f"  Path: {d['path']}  MAC: {mac_display}"
                     
                     row = 4 + (i * 3)
                     
@@ -381,7 +433,13 @@ class ControllerMenu:
                 new_pos = (current_pos + 1) % len(available_indices)
                 sel = available_indices[new_pos]
             elif key in (10, 13) and available_indices and sel in available_indices:
-                assign(self.controllers[sel])
+                chosen = self.controllers[sel]
+                assign(chosen)
+
+                # Save global assignment for this role
+                assignments = load_assignments()
+                assignments[role] = chosen.get("mac")
+                save_assignments(assignments)
                 break
             elif key in (ord('r'), ord('R')):
                 sel = available_indices[0] if available_indices else 0  # Reset to first available
@@ -409,14 +467,22 @@ class ControllerMenu:
             elif key in (10, 13):
                 if self.selection == 0:
                     # Select DRIVE - exclude ARM controller if selected
-                    self.popup_select(stdscr, "Select DRIVE Controller", 
-                                     lambda d: setattr(self, "drive", d), 
-                                     exclude_controller=self.arm)
+                    self.popup_select(
+                        stdscr,
+                        "Select DRIVE Controller",
+                        lambda d: setattr(self, "drive", d),
+                        "drive",
+                        exclude_controller=self.arm,
+                    )
                 elif self.selection == 1:
                     # Select ARM - exclude DRIVE controller if selected
-                    self.popup_select(stdscr, "Select ARM Controller", 
-                                     lambda d: setattr(self, "arm", d),
-                                     exclude_controller=self.drive)
+                    self.popup_select(
+                        stdscr,
+                        "Select ARM Controller",
+                        lambda d: setattr(self, "arm", d),
+                        "arm",
+                        exclude_controller=self.drive,
+                    )
                 elif self.selection == 2:
                     # Toggle DRIVE State - print to terminal
                     if not self.drive_state:
@@ -440,6 +506,18 @@ class ControllerMenu:
                 self.refresh_controllers()
             elif key in (ord('q'), ord('Q')):
                 break
+
+        # After leaving the loop, remove our assignments from the global file
+        assignments = load_assignments()
+        if self.drive:
+            drive_mac = self.drive.get("mac")
+            if assignments.get("drive") == drive_mac:
+                assignments.pop("drive", None)
+        if self.arm:
+            arm_mac = self.arm.get("mac")
+            if assignments.get("arm") == arm_mac:
+                assignments.pop("arm", None)
+        save_assignments(assignments)
 
 
 def main(stdscr):
