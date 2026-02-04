@@ -165,8 +165,47 @@ if ROS2_AVAILABLE:
             self.drive_dummy_node = None
             self.safety_timer = None
 
+            self.drive_mode = "Manual"
+            self.arm_mode = "Manual"
+
             self._last_drive_model = None
             self._last_arm_model = None
+
+            # Mode Publishers & Subscribers (Source of Truth)
+            self.drive_mode_pub = self.create_publisher(String, "/drive/mode", 10)
+            self.arm_mode_pub = self.create_publisher(String, "/arm/mode", 10)
+            
+            self.drive_mode_sub = self.create_subscription(String, "/drive/mode", self._drive_mode_callback, 10)
+            self.arm_mode_sub = self.create_subscription(String, "/arm/mode", self._arm_mode_callback, 10)
+
+            # Status Publisher
+            self.status_publisher = self.create_publisher(String, "/controller_status", 10)
+
+        def publish_status(self, drive_info, arm_info):
+            """Publish current controller assignments to /controller_status"""
+            if self.status_publisher:
+                msg = String()
+                # Include local mode state in published status
+                drive_mode = self.drive_mode if hasattr(self, 'drive_mode') else "Unknown"
+                arm_mode = self.arm_mode if hasattr(self, 'arm_mode') else "Unknown"
+                
+                data = {
+                    "drive": drive_info,
+                    "drive_mode": drive_mode,
+                    "arm": arm_info,
+                    "arm_mode": arm_mode
+                }
+                try:
+                    msg.data = json.dumps(data)
+                    self.status_publisher.publish(msg)
+                except Exception:
+                    pass
+
+        def _drive_mode_callback(self, msg):
+            self.drive_mode = msg.data
+
+        def _arm_mode_callback(self, msg):
+            self.arm_mode = msg.data
 
         # ================== DRIVE / ARM ENABLE/DISABLE ==================
 
@@ -233,6 +272,36 @@ if ROS2_AVAILABLE:
         def _drive_joy_callback(self, joy: Joy):
             model = self._detect_controller_model(joy)
             self._last_drive_model = model
+
+            # --- MODE SWITCHING LOGIC (Publish to Topic) ---
+            target_mode = None
+            if model == "Xbox-360 Controller":
+                if len(joy.buttons) > 2 and joy.buttons[2]:
+                    target_mode = "Manual"
+                elif len(joy.buttons) > 1 and joy.buttons[1]:
+                    target_mode = "Autonomous"
+                    
+            elif model == "PS4 Controller":
+                if len(joy.buttons) > 3 and joy.buttons[3]:
+                    target_mode = "Manual"
+                elif len(joy.buttons) > 1 and joy.buttons[1]:
+                    target_mode = "Autonomous"
+                    
+            elif model == "Logitech X-3D Pro":
+                if len(joy.buttons) > 1 and joy.buttons[1]:
+                    target_mode = "Manual"
+                elif len(joy.buttons) > 2 and joy.buttons[2]:
+                    target_mode = "Autonomous"
+            
+            if target_mode and target_mode != self.drive_mode:
+                msg = String()
+                msg.data = target_mode
+                self.drive_mode_pub.publish(msg)
+            
+            # If in Autonomous mode, do NOT process or publish drive commands
+            if self.drive_mode != "Manual":
+                return
+
             twist = Twist()
 
             if model == "Xbox-360 Controller":
@@ -276,6 +345,35 @@ if ROS2_AVAILABLE:
             model = self._detect_controller_model(joy)
             self._last_arm_model = model
 
+            # --- MODE SWITCHING LOGIC (Publish to Topic) ---
+            target_mode = None
+            if model == "Xbox-360 Controller":
+                if len(joy.buttons) > 2 and joy.buttons[2]:
+                    target_mode = "Manual"
+                elif len(joy.buttons) > 1 and joy.buttons[1]:
+                    target_mode = "Autonomous"
+                    
+            elif model == "PS4 Controller":
+                if len(joy.buttons) > 3 and joy.buttons[3]:
+                    target_mode = "Manual"
+                elif len(joy.buttons) > 1 and joy.buttons[1]:
+                    target_mode = "Autonomous"
+                    
+            elif model == "Logitech X-3D Pro":
+                if len(joy.buttons) > 1 and joy.buttons[1]:
+                    target_mode = "Manual"
+                elif len(joy.buttons) > 2 and joy.buttons[2]:
+                    target_mode = "Autonomous"
+            
+            if target_mode and target_mode != self.arm_mode:
+                msg = String()
+                msg.data = target_mode
+                self.arm_mode_pub.publish(msg)
+            
+            # If in Autonomous mode, do NOT process or publish arm commands
+            if self.arm_mode != "Manual":
+                return
+
             twist = Twist()
 
             if model in ("Xbox-360 Controller", "PS4 Controller"):
@@ -309,8 +407,6 @@ class ControllerMenu:
         self.controllers = []
         self.drive = None
         self.arm = None
-        self.drive_on = False
-        self.arm_on = False
         self.selection = 0
 
         # joy_node subprocess handles
@@ -327,8 +423,15 @@ class ControllerMenu:
             "Select ARM Controller",
             "Toggle DRIVE ROS Node",
             "Toggle ARM ROS Node",
+            "Clear Screen",
+            "Reset Configuration",
             "Exit"
         ]
+
+        # Initialize ROS and Node immediately to enable topic scanning on startup
+        if ROS2_AVAILABLE:
+            self._init_ros()
+            self._ensure_teleop_node()
 
     def _init_ros(self):
         """Initialize ROS2 if available"""
@@ -511,77 +614,109 @@ class ControllerMenu:
         Returns:
             bool: True if topic exists in the graph, False otherwise
         """
-        if not ROS2_AVAILABLE or not self.ros_initialized:
+        if not ROS2_AVAILABLE:
             return False
         
+        # Ensure ROS is initialized
+        if not self.ros_initialized:
+            self._init_ros()
+            
+        if not self.ros_initialized:
+            return False
+
         try:
-            # Create a temporary node for topic discovery if teleop_node doesn't exist
+            # Ensure we have a node to query topics
+            if self.teleop_node is None:
+                # Instantiate the node for scanning purposes.
+                # Safe because it doesn't publish until explicitly enabled.
+                self._ensure_teleop_node()
+            
             if self.teleop_node:
-                node_for_query = self.teleop_node
-            else:
-                # If no teleop node exists yet, we need to check the graph differently
-                # In this case, we'll try to initialize ROS and create a temporary minimal node
-                if not self._init_ros():
-                    return False
-                # Without a node, we can't query topics, so return False
-                return False
-            
-            # Get all available topics in the ROS graph
-            topics = node_for_query.get_topic_names_and_types()
-            
-            # Check if our target topic exists
-            for name, _types in topics:
-                if name == topic_name:
-                    return True
+                # Use count_publishers for more accurate/instant status
+                # get_topic_names_and_types can be sticky/delayed
+                return self.teleop_node.count_publishers(topic_name) > 0
             
             return False
         except Exception:
             return False
 
-    # -------- CONTROLLER REFRESH (NO AUTO-ASSIGN) --------
+    # -------- CONTROLLER REFRESH (STRICT SYNC) --------
     def refresh_controllers(self):
-        """Refresh controller list but do NOT auto-assign.
-        User must manually select controllers.
+        """Refresh controller list and strictly sync with global assignments file.
+        This ensures all terminals reflect the same state (including deselecting).
         """
         self.controllers = find_joysticks()
-
-        # Restore from global assignments if possible
         assignments = load_assignments()
-        if not self.drive and assignments.get("drive"):
-            for ctrl in self.controllers:
-                if ctrl["mac"] == assignments["drive"]:
-                    self.drive = ctrl
-                    break
-        if not self.arm and assignments.get("arm"):
-            for ctrl in self.controllers:
-                if ctrl["mac"] == assignments["arm"]:
-                    self.arm = ctrl
-                    break
 
-        # Check if selected controllers are still connected
-        if self.drive and self.drive not in self.controllers:
-            # Find by MAC if controller reconnected on different path
-            for ctrl in self.controllers:
-                if ctrl["mac"] == self.drive["mac"]:
-                    self.drive = ctrl
-                    break
+        def find_by_mac(mac):
+            for c in self.controllers:
+                if c["mac"] == mac:
+                    return c
+            return None
+
+        # --- SYNC DRIVE ---
+        global_drive_mac = assignments.get("drive")
+        if global_drive_mac:
+            # If global assignment exists, ensure we match it
+            if not self.drive or self.drive["mac"] != global_drive_mac:
+                # Try to find the assigned controller
+                candidate = find_by_mac(global_drive_mac)
+                if candidate:
+                    self.drive = candidate
+                else:
+                    # Assigned controller not connected? Deselect.
+                    self.drive = None
             else:
+                # We match global, but is it still connected?
+                if self.drive and self.drive not in self.controllers:
+                    # Handle reconnection path changes
+                    rec = find_by_mac(global_drive_mac)
+                    if rec:
+                        self.drive = rec
+                    else:
+                        self.drive = None
+        else:
+            # No global assignment -> Deselect locally
+            if self.drive:
                 self.drive = None
 
-        if self.arm and self.arm not in self.controllers:
-            for ctrl in self.controllers:
-                if ctrl["mac"] == self.arm["mac"]:
-                    self.arm = ctrl
-                    break
+        # --- SYNC ARM ---
+        global_arm_mac = assignments.get("arm")
+        if global_arm_mac:
+            if not self.arm or self.arm["mac"] != global_arm_mac:
+                candidate = find_by_mac(global_arm_mac)
+                if candidate:
+                    self.arm = candidate
+                else:
+                    self.arm = None
             else:
+                if self.arm and self.arm not in self.controllers:
+                    rec = find_by_mac(global_arm_mac)
+                    if rec:
+                        self.arm = rec
+                    else:
+                        self.arm = None
+        else:
+            if self.arm:
                 self.arm = None
+
+        # Publish status to ROS
+        if self.teleop_node and hasattr(self.teleop_node, 'publish_status'):
+            self.teleop_node.publish_status(self.drive, self.arm)
 
     # ---------------- DRAW ----------------
     def draw(self, stdscr):
-        stdscr.clear()
+        # 1. Fetch Data First (Minimize flickering by doing IO before touching screen)
+        self.refresh_controllers()
+        d_ros_active = self._scan_topic_exists("/buswala")
+        a_ros_active = self._scan_topic_exists("/aram")
+
+        # 2. Update UI
+        # Use erase() instead of clear() to avoid sending a hardware clear-screen command
+        # which causes flickering. erase() just overwrites the buffer with background.
+        stdscr.erase()
         h, w = stdscr.getmaxyx()
         mid = w // 2
-        self.refresh_controllers()
 
         stdscr.addstr(1, 2, "ROS CONTROLLER CONFIGURATION", curses.A_BOLD | curses.color_pair(4))
 
@@ -595,16 +730,20 @@ class ControllerMenu:
         stdscr.addstr(y, 2, "DRIVE", curses.A_BOLD | curses.color_pair(3))
         if self.drive:
             owner = self.drive.get("owner", "Unknown")
+            # Get current mode from teleop node (default to Manual if node not running)
+            mode = self.teleop_node.drive_mode if (self.teleop_node and d_ros_active) else "Manual"
             try:
                 stdscr.addstr(y + 1, 4, f"[P] {owner}", curses.color_pair(2) | curses.A_BOLD)
                 stdscr.addstr(y + 2, 4, f"MAC: {self.drive['mac'][:w-10]}", curses.color_pair(4))
+                # Display Mode right below MAC
+                mode_color = curses.color_pair(1) if mode == "Manual" else curses.color_pair(2)
+                stdscr.addstr(y + 3, 4, f"Mode: {mode}", mode_color | curses.A_BOLD)
             except curses.error:
                 pass
         else:
             stdscr.addstr(y + 1, 4, "Not selected", curses.color_pair(1))
         
-        # Drive ROS status - scan topics universally
-        d_ros_active = self._scan_topic_exists("/buswala")
+        # Drive ROS status
         d_ros = "* PUBLISHING" if d_ros_active else "o INACTIVE"
         try:
             stdscr.addstr(y + 4, 4, f"ROS: {d_ros}", curses.color_pair(2 if d_ros_active else 1))
@@ -616,16 +755,20 @@ class ControllerMenu:
         stdscr.addstr(y, 2, "ARM", curses.A_BOLD | curses.color_pair(3))
         if self.arm:
             owner = self.arm.get("owner", "Unknown")
+            # Get current mode from teleop node
+            mode = self.teleop_node.arm_mode if (self.teleop_node and a_ros_active) else "Manual"
             try:
                 stdscr.addstr(y + 1, 4, f"[P] {owner}", curses.color_pair(2) | curses.A_BOLD)
                 stdscr.addstr(y + 2, 4, f"MAC: {self.arm['mac'][:w-10]}", curses.color_pair(4))
+                 # Display Mode right below MAC
+                mode_color = curses.color_pair(1) if mode == "Manual" else curses.color_pair(2)
+                stdscr.addstr(y + 3, 4, f"Mode: {mode}", mode_color | curses.A_BOLD)
             except curses.error:
                 pass
         else:
             stdscr.addstr(y + 1, 4, "Not selected", curses.color_pair(1))
 
-        # ARM ROS status - scan topics universally
-        a_ros_active = self._scan_topic_exists("/aram")
+        # ARM ROS status
         a_ros = "* PUBLISHING" if a_ros_active else "o INACTIVE"
         try:
             stdscr.addstr(y + 4, 4, f"ROS: {a_ros}", curses.color_pair(2 if a_ros_active else 1))
@@ -634,7 +777,13 @@ class ControllerMenu:
 
         # MENU
         y = 15
-        for i, item in enumerate(self.menu):
+        
+        # Update menu labels to show 'Start'/'Stop' state
+        display_menu = list(self.menu)
+        display_menu[2] = f"{'Stop' if d_ros_active else 'Start'} DRIVE ROS Node"
+        display_menu[3] = f"{'Stop' if a_ros_active else 'Start'} ARM ROS Node"
+
+        for i, item in enumerate(display_menu):
             if i == self.selection:
                 stdscr.attron(curses.A_REVERSE)
             if y + i < h - 1:
@@ -643,26 +792,8 @@ class ControllerMenu:
                 stdscr.attroff(curses.A_REVERSE)
 
         # --- DASHBOARD SECTION (Mode Only) ---
-        dash_y = h - 8  # Fixed position near the bottom
+        # dashboard code removed as mode is now displayed under controller info
         
-        # Only draw mode section if there's enough space
-        if dash_y > y + len(self.menu) and dash_y > 0:
-            # Check if the node exists to get the real mode
-            is_manual = self.teleop_node.is_manual_mode() if self.teleop_node else False
-            
-            # DRIVE Side
-            try:
-                stdscr.addstr(dash_y, 4, "DRIVE", curses.A_BOLD)
-                stdscr.addstr(dash_y + 1, 4, f"{'o' if is_manual else '*'} Autonomous")
-                stdscr.addstr(dash_y + 2, 4, f"{'*' if is_manual else 'o'} Manual")
-
-                # ARM Side (Update logic here if ARM also has modes)
-                stdscr.addstr(dash_y, mid + 4, "ARM", curses.A_BOLD)
-                stdscr.addstr(dash_y + 1, mid + 4, "o Autonomous")
-                stdscr.addstr(dash_y + 2, mid + 4, "* Manual")
-            except curses.error:
-                pass  # Ignore curses errors from writing at edge of screen
-
         # Standard Footer
         try:
             stdscr.addstr(h - 2, 0, "Up/Down Navigate | ENTER Select | Q Quit".center(w)[:w-1], curses.A_REVERSE)
@@ -784,10 +915,16 @@ class ControllerMenu:
         curses.init_pair(3, curses.COLOR_CYAN, curses.COLOR_BLACK)
         curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
+        # Set a timeout for getch so the loop continues and UI refreshes (e.g., every 500ms)
+        stdscr.timeout(500)
+
         try:
             while True:
                 self.draw(stdscr)
                 key = stdscr.getch()
+                
+                if key == -1:
+                    continue
 
                 if key == curses.KEY_UP:
                     self.selection = (self.selection - 1) % len(self.menu)
@@ -814,31 +951,39 @@ class ControllerMenu:
                         )
                     elif self.selection == 2:
                         # Toggle DRIVE ROS Node
-                        if not self.drive_on:
+                        is_active = self._scan_topic_exists("/buswala")
+                        if not is_active:
                             if self.drive:
-                                if self._start_drive_ros():
-                                    self.drive_on = True
-                                else:
+                                if not self._start_drive_ros():
                                     self._show_message(stdscr, "Error", "Failed to start ROS node. Check ROS2 installation.")
                             else:
                                 self._show_message(stdscr, "No Controller", "Select a DRIVE controller first.")
                         else:
                             self._stop_drive_ros()
-                            self.drive_on = False
                     elif self.selection == 3:
                         # Toggle ARM ROS Node
-                        if not self.arm_on:
+                        is_active = self._scan_topic_exists("/aram")
+                        if not is_active:
                             if self.arm:
-                                if self._start_arm_ros():
-                                    self.arm_on = True
-                                else:
+                                if not self._start_arm_ros():
                                     self._show_message(stdscr, "Error", "Failed to start ROS node. Check ROS2 installation.")
                             else:
                                 self._show_message(stdscr, "No Controller", "Select an ARM controller first.")
                         else:
                             self._stop_arm_ros()
-                            self.arm_on = False
                     elif self.selection == 4:
+                        # Clear Screen
+                        stdscr.clear()
+                        stdscr.refresh()
+                    elif self.selection == 5:
+                        # Reset Configuration
+                        self._stop_drive_ros()
+                        self._stop_arm_ros()
+                        self.drive = None
+                        self.arm = None
+                        save_assignments({})
+                        self._show_message(stdscr, "Reset", "Configuration reset to default.\nControllers and ROS nodes stopped.")
+                    elif self.selection == 6:
                         break
                 elif key in (ord('r'), ord('R')):
                     # Manual refresh
@@ -847,8 +992,6 @@ class ControllerMenu:
                     break
         finally:
             # Cleanup - stop all joy_node processes and teleop node
-            self.drive_on = False
-            self.arm_on = False
             self._stop_drive_ros()
             self._stop_arm_ros()
             
@@ -865,17 +1008,9 @@ class ControllerMenu:
             time.sleep(0.1)
             self._shutdown_ros()
 
-            # After leaving the loop, remove our assignments from the global file
-            assignments = load_assignments()
-            if self.drive:
-                drive_mac = self.drive.get("mac")
-                if assignments.get("drive") == drive_mac:
-                    assignments.pop("drive", None)
-            if self.arm:
-                arm_mac = self.arm.get("mac")
-                if assignments.get("arm") == arm_mac:
-                    assignments.pop("arm", None)
-            save_assignments(assignments)
+            # Clear assignments file explicitly on exit
+            # This ensures other terminals see that no controllers are selected/locked
+            save_assignments({})
 
     def _show_message(self, stdscr, title, message):
         stdscr.clear()
